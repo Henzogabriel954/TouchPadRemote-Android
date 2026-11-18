@@ -1,0 +1,63 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      - name: Run protocol tests & build Debug APK
+        run: gradle :shared-protocol:test :android-app:assembleDebug --no-daemon
+
+      - name: Prepare APK asset
+        run: |
+          mkdir -p release-assets
+          cp android-app/build/outputs/apk/debug/android-app-debug.apk release-assets/TouchPadRemote-Android-v1.0.0.apk
+
+      - name: Publish Release v1.0.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: TouchPad Remote Android v1.0.0
+          body: |
+            ## TouchPad Remote — Aplicativo Android (v1.0.0)
+
+            Transforme seu celular Android em um touchpad sem fio para Windows (inclusive para jogos 3D como Minecraft).
+
+            ### Download
+            Baixe **`TouchPadRemote-Android-v1.0.0.apk`** abaixo e instale no celular.
+
+            ### Recursos
+            - Tela inicial com quadrados para cada computador cadastrado e busca automática na rede Wi-Fi.
+            - Só abre o touchpad quando o computador Windows estiver **Online** e após clicar em **Aceitar Pareamento** no PC.
+            - Tela cheia preta com risco central separando clique esquerdo (ESQ) e clique direito (DIR).
+            - Manter o dedo pressionado (260ms) para segurar/arrastar sem atrapalhar cliques rápidos em jogos.
+            - Rolagem com 2 dedos.
+
+            ### Servidor Windows (Obrigatório no PC)
+            Baixe o servidor Windows em: https://github.com/Henzogabriel954/TouchPadRemote-Windows/releases/latest
+          files: release-assets/TouchPadRemote-Android-v1.0.0.apk
