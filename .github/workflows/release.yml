@@ -36,7 +36,14 @@ jobs:
           echo "Using Android SDK at: $SDK_DIR"
           SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | head -n 1)
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platforms;android-34" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+          "$SDKMANAGER" "platforms;android-34" "build-tools;35.0.0"
+          if [ -z "${ANDROID_NDK_ROOT:-}" ] || [ ! -d "$ANDROID_NDK_ROOT" ]; then
+            "$SDKMANAGER" "ndk;${NDK_VERSION}"
+            echo "ANDROID_NDK_HOME=$SDK_DIR/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+            echo "ANDROID_NDK_ROOT=$SDK_DIR/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          else
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> "$GITHUB_ENV"
+          fi
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -47,9 +54,7 @@ jobs:
 
       - name: Build Android native Rust libraries (.so)
         run: |
-          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          export ANDROID_NDK_HOME="$SDK_DIR/ndk/$NDK_VERSION"
-          cargo ndk -p 24 -t arm64-v8a -t armeabi-v7a -t x86_64 -o android-app/src/main/jniLibs build --locked --release -p touchpad-android-core
+          cargo ndk -P 24 -t arm64-v8a -t armeabi-v7a -t x86_64 -o android-app/src/main/jniLibs build --locked --release -p touchpad-android-core
 
       - name: Build Debug APK
         run: |
