@@ -58,7 +58,7 @@ jobs:
 
       - name: Build Debug APK
         run: |
-          gradle --no-daemon :android-app:assembleDebug
+          gradle --no-daemon --max-workers=2 "-Dorg.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8" :android-app:assembleDebug
           mkdir -p dist
           cp android-app/build/outputs/apk/debug/android-app-debug.apk "dist/TouchPadRemote-Android-${GITHUB_REF_NAME:-dev}.apk"
 
@@ -102,3 +102,4 @@ jobs:
             - **Linux**: https://github.com/Henzogabriel954/TouchPadRemote-Linux/releases/latest
           files: dist/TouchPadRemote-Android-*.apk
           fail_on_unmatched_files: true
+
