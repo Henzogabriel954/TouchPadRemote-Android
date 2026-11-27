@@ -1,0 +1,22 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "crates/touchpad-protocol",
+    "crates/touchpad-storage",
+    "crates/touchpad-server-core",
+    "crates/touchpad-android-core",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+uuid = { version = "1.11", features = ["v4"] }
+if-addrs = "0.13"
+directories = "6.0"
+jni = "0.21"

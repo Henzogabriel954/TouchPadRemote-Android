@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
@@ -84,8 +85,10 @@ import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import com.touchpad.android.model.ComputerProfile
-import com.touchpad.protocol.ConnectionMethod
-import com.touchpad.protocol.TouchpadPacket
+import com.touchpad.android.model.AndroidSettings
+import com.touchpad.android.model.ConnectionMethod
+import com.touchpad.android.model.DEFAULT_PORT
+import com.touchpad.android.model.EdgeLink
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -111,6 +114,11 @@ fun ComputerListScreen(
     pairingComputer: ComputerProfile?,
     offlineAlertComputer: ComputerProfile?,
     infoErrorMessage: String?,
+    settings: AndroidSettings,
+    edgeLinks: List<EdgeLink>,
+    coreAvailable: Boolean,
+    onSaveSettings: (AndroidSettings) -> Unit,
+    onSaveLayout: (List<EdgeLink>, Boolean, Int, String?) -> Unit,
     onSelectComputer: (ComputerProfile) -> Unit,
     onAddComputer: (ComputerProfile) -> Unit,
     onRemoveComputer: (String) -> Unit,
@@ -125,6 +133,8 @@ fun ComputerListScreen(
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
     var autoScanOnOpen by rememberSaveable { mutableStateOf(false) }
     var showMethodsDialog by rememberSaveable { mutableStateOf(false) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    var showMultiPc by rememberSaveable { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<ComputerProfile?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -185,7 +195,26 @@ fun ComputerListScreen(
                 onRefreshClick = onRefreshStatus
             )
 
-            if (computers.isEmpty()) {
+            if (coreAvailable) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(onClick = { showMultiPc = true }) { Text("Multi-PC (Bordas)") }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Configurações")
+                    }
+                }
+            }
+
+            if (!coreAvailable) {
+                Text(
+                    "Núcleo do TouchPad Remote indisponível.",
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.error
+                )
+            } else if (computers.isEmpty()) {
                 EmptyComputersView(
                     onOpenAddManual = {
                         autoScanOnOpen = false
@@ -231,7 +260,20 @@ fun ComputerListScreen(
         }
     }
 
-    if (showAddDialog) {
+    if (showSettings && coreAvailable) {
+        SettingsDialog(settings, onDismiss = { showSettings = false }) {
+            onSaveSettings(it)
+            showSettings = false
+        }
+    }
+    if (showMultiPc && coreAvailable) {
+        MultiPcLayoutDialog(computers, edgeLinks, settings, onDismiss = { showMultiPc = false }) {
+            links, enabled, overshoot, primaryId ->
+            onSaveLayout(links, enabled, overshoot, primaryId)
+            showMultiPc = false
+        }
+    }
+    if (showAddDialog && coreAvailable) {
         AddComputerDialog(
             autoScanOnOpen = autoScanOnOpen,
             isScanning = isScanningNetwork,
@@ -309,7 +351,7 @@ fun ComputerListScreen(
             },
             text = {
                 Text(
-                    text = "O computador \"${pc.name}\" (${pc.ipAddress}:${pc.port}) está offline ou não respondeu.\n\nAbra o aplicativo TouchPad Remote no Windows e confira se ambos estão no mesmo Wi-Fi.",
+                    text = "O computador \"${pc.name}\" (${pc.ipAddress}:${pc.port}) está offline ou não respondeu.\n\nAbra o aplicativo TouchPad Remote no computador e confira se ambos estão no mesmo Wi-Fi.",
                     lineHeight = 20.sp
                 )
             },
@@ -346,7 +388,7 @@ fun ComputerListScreen(
             textContentColor = TextSecondary,
             title = {
                 Text(
-                    text = "Aceite o Pareamento no Windows",
+                    text = "Aceite o pareamento no computador",
                     fontWeight = FontWeight.Bold
                 )
             },
@@ -585,7 +627,31 @@ private fun ComputerSquareCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                Spacer(modifier = Modifier.height(8.dp))
+                val os = when (computer.lastOs?.uppercase()) {
+                    "WINDOWS" -> "Windows"
+                    "LINUX" -> "Linux"
+                    else -> null
+                }
+                val privilege = when (computer.lastPrivilege?.uppercase()) {
+                    "USER" -> if (os == "Windows") "UAC" else null
+                    "ADMIN" -> "Admin"
+                    "SYSTEM" -> "Sistema"
+                    "UINPUT" -> "uinput"
+                    "XTEST" -> "XTest"
+                    else -> null
+                }
+                val hostLabel = listOfNotNull(os, privilege).joinToString(" · ")
+                if (hostLabel.isNotEmpty()) {
+                    Text(
+                        text = hostLabel,
+                        color = TextSecondary,
+                        fontSize = 10.sp,
+                        lineHeight = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -748,7 +814,7 @@ private fun AddComputerDialog(
 ) {
     var name by rememberSaveable { mutableStateOf("") }
     var ipAddress by rememberSaveable { mutableStateOf("") }
-    var portText by rememberSaveable { mutableStateOf(TouchpadPacket.DEFAULT_PORT.toString()) }
+    var portText by rememberSaveable { mutableStateOf(DEFAULT_PORT.toString()) }
 
     var nameError by remember { mutableStateOf<String?>(null) }
     var ipError by remember { mutableStateOf<String?>(null) }
@@ -893,7 +959,7 @@ private fun AddComputerDialog(
                 } else if (hasScannedOnce && !isScanning) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Nenhum PC encontrado automaticamente. Verifique se o aplicativo Windows está aberto na mesma rede Wi-Fi ou digite o IP manualmente abaixo.",
+                        text = "Nenhum PC encontrado automaticamente. Verifique se o TouchPad Remote está aberto no computador na mesma rede Wi-Fi ou digite o IP manualmente abaixo.",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         lineHeight = 16.sp

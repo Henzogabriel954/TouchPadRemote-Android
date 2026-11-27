@@ -1,68 +1,100 @@
-name: Build & Release Android APK
+﻿name: Build & Release Android APK
 
 on:
   push:
     branches: [ "main" ]
     tags: [ "v*" ]
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: '27.2.12479018'
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Android Rust targets and cargo-ndk
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install cargo-ndk --locked
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Ensure Android SDK licenses & packages
+      - uses: android-actions/setup-android@v3
+
+      - name: Ensure Android SDK packages and NDK
         run: |
           SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
-          echo "Using Android SDK at: $SDK_DIR"
           SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | head -n 1)
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platforms;android-34" "build-tools;35.0.0"
+          "$SDKMANAGER" "platforms;android-34" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
 
-      - name: Set up Gradle 8.13
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
 
-      - name: Run protocol tests & build Debug APK
-        run: gradle :shared-protocol:test :android-app:assembleDebug --no-daemon
+      - name: Run Rust protocol, storage & Android core tests
+        run: cargo test --locked -p touchpad-protocol -p touchpad-storage -p touchpad-android-core
 
-      - name: Prepare APK asset
+      - name: Build Android native Rust libraries (.so)
         run: |
-          mkdir -p release-assets
-          cp android-app/build/outputs/apk/debug/android-app-debug.apk release-assets/TouchPadRemote-Android-v1.0.0.apk
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          export ANDROID_NDK_HOME="$SDK_DIR/ndk/$NDK_VERSION"
+          cargo ndk -p 24 -t arm64-v8a -t armeabi-v7a -t x86_64 -o android-app/src/main/jniLibs build --locked --release -p touchpad-android-core
 
-      - name: Publish Release v1.0.0
+      - name: Build Debug APK
+        run: |
+          gradle --no-daemon :android-app:assembleDebug
+          mkdir -p dist
+          cp android-app/build/outputs/apk/debug/android-app-debug.apk "dist/TouchPadRemote-Android-${GITHUB_REF_NAME:-dev}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: touchpad-android
+          path: dist/TouchPadRemote-Android-*.apk
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: touchpad-android
+          path: dist
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: TouchPad Remote Android v1.0.0
+          name: "TouchPad Remote Android ${{ github.ref_name }}"
           body: |
-            ## TouchPad Remote — Aplicativo Android (v1.0.0)
+            ## TouchPad Remote — Aplicativo Android (${{ github.ref_name }})
 
-            Transforme seu celular Android em um touchpad sem fio para Windows (inclusive para jogos 3D como Minecraft).
+            Transforme seu celular Android em um touchpad sem fio com motor nativo em **Rust (JNI)** e troca automática **Multi-PC pela borda da tela** orquestrada pelo celular.
 
             ### Download
-            Baixe **`TouchPadRemote-Android-v1.0.0.apk`** abaixo e instale no celular.
+            Baixe o APK abaixo e instale no celular.
 
-            ### Recursos
-            - Tela inicial com quadrados para cada computador cadastrado e busca automática na rede Wi-Fi.
-            - Só abre o touchpad quando o computador Windows estiver **Online** e após clicar em **Aceitar Pareamento** no PC.
-            - Tela cheia preta com risco central separando clique esquerdo (ESQ) e clique direito (DIR).
-            - Manter o dedo pressionado (260ms) para segurar/arrastar sem atrapalhar cliques rápidos em jogos.
-            - Rolagem com 2 dedos.
+            ### Novidades v2.0
+            - **Motor 100% Rust via JNI** (`libtouchpad_android_core.so`) para UDP, pareamento, descoberta LAN, persistência e roteamento Multi-PC.
+            - **Multi-PC por bordas**: conecte o celular a 2 ou mais PCs e passe o cursor de um PC ao outro ao encostar na borda configurada — sem nenhuma conexão direta entre os PCs.
+            - **Travar PC & Troca Manual** na barra discreta da tela cheia (ideal para jogos 3D como Minecraft).
+            - **Configurações salvas**: tempo de segurar clique, sensibilidade local, vibração háptica e orientação padrão.
 
-            ### Servidor Windows (Obrigatório no PC)
-            Baixe o servidor Windows em: https://github.com/Henzogabriel954/TouchPadRemote-Windows/releases/latest
-          files: release-assets/TouchPadRemote-Android-v1.0.0.apk
+            ### Servidores Desktop (Windows e Linux)
+            - **Windows**: https://github.com/Henzogabriel954/TouchPadRemote-Windows/releases/latest
+            - **Linux**: https://github.com/Henzogabriel954/TouchPadRemote-Linux/releases/latest
+          files: dist/TouchPadRemote-Android-*.apk
+          fail_on_unmatched_files: true

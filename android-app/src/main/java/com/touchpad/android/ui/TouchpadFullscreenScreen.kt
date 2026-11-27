@@ -14,9 +14,13 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -30,6 +34,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
@@ -69,14 +75,16 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import com.touchpad.android.model.ComputerProfile
-import com.touchpad.protocol.MouseButton
-import com.touchpad.protocol.TouchpadPacket
-import kotlinx.coroutines.channels.Channel
+import com.touchpad.android.model.ActiveSession
+import com.touchpad.android.model.AndroidSettings
+import com.touchpad.android.model.SessionPeer
+import com.touchpad.android.nativecore.RustTouchpadBridge
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+
+private enum class MouseButton { LEFT, RIGHT }
 
 private data class TapFlashEvent(
     val id: Long,
@@ -86,9 +94,11 @@ private data class TapFlashEvent(
 
 @Composable
 fun TouchpadFullscreenScreen(
-    computer: ComputerProfile,
-    onSendPacket: suspend (TouchpadPacket) -> Unit,
-    onPingComputer: suspend () -> Boolean,
+    session: ActiveSession,
+    neighbors: List<SessionPeer>,
+    settings: AndroidSettings,
+    onSwitchActiveComputer: (String) -> Unit,
+    onSetEdgeLock: (Boolean) -> Unit,
     onExit: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -98,67 +108,36 @@ fun TouchpadFullscreenScreen(
     val activity = remember(context) { context.findActivity() }
     val density = LocalDensity.current
 
-    var isLandscape by rememberSaveable { mutableStateOf(true) }
-    var isConnected by remember { mutableStateOf(false) }
+    var isLandscape by rememberSaveable { mutableStateOf(settings.defaultLandscape) }
     var heldMouseButton by remember { mutableStateOf<MouseButton?>(null) }
     var tapFlash by remember { mutableStateOf<TapFlashEvent?>(null) }
     val flashAlpha = remember { Animatable(0f) }
     val gestureScope = rememberCoroutineScope()
+    var pendingHold by remember { mutableStateOf<Job?>(null) }
+    var inputGeneration by remember { mutableStateOf(0) }
+    val latestOnExit by rememberUpdatedState(onExit)
+    val latestHaptics by rememberUpdatedState(settings.hapticsEnabled)
+    val core = RustTouchpadBridge
 
-    val packetChannel = remember(computer.id) {
-        Channel<TouchpadPacket>(capacity = Channel.UNLIMITED)
+    fun releaseHeldButton() {
+        heldMouseButton?.let { button ->
+            core.nativeSendButtonState(button.ordinal, false)
+            heldMouseButton = null
+        }
     }
 
-    val latestSendPacket by rememberUpdatedState(onSendPacket)
-    val latestPing by rememberUpdatedState(onPingComputer)
-    val latestOnExit by rememberUpdatedState(onExit)
+    fun cancelInput() {
+        inputGeneration++
+        pendingHold?.cancel()
+        releaseHeldButton()
+    }
 
-    val releaseHoldAndExit = {
-        heldMouseButton?.let { btn ->
-            heldMouseButton = null
-            packetChannel.trySend(TouchpadPacket.ButtonState(btn, pressed = false))
-        }
+    val releaseHoldAndExit: () -> Unit = {
+        cancelInput()
         latestOnExit()
     }
 
-    BackHandler {
-        releaseHoldAndExit()
-    }
-
-    // Sequentially deliver outgoing packets on IO without blocking touch input.
-    LaunchedEffect(packetChannel) {
-        for (packet in packetChannel) {
-            latestSendPacket(packet)
-        }
-    }
-
-    // Periodically check target host reachability; auto-exit if 2 consecutive pings fail.
-    LaunchedEffect(computer.id, computer.ipAddress, computer.port) {
-        var missedPings = 0
-        while (isActive) {
-            val ok = latestPing()
-            isConnected = ok
-            if (ok) {
-                missedPings = 0
-            } else {
-                missedPings++
-                if (missedPings >= 2) {
-                    heldMouseButton?.let { btn ->
-                        heldMouseButton = null
-                        packetChannel.trySend(
-                            TouchpadPacket.ButtonState(
-                                button = btn,
-                                pressed = false
-                            )
-                        )
-                    }
-                    latestOnExit()
-                    break
-                }
-            }
-            delay(2500L)
-        }
-    }
+    BackHandler(onBack = releaseHoldAndExit)
 
     // Animate visual tap feedback on the left or right half of the touchpad.
     LaunchedEffect(tapFlash?.id) {
@@ -175,15 +154,6 @@ fun TouchpadFullscreenScreen(
             ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         } else {
             ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        }
-    }
-
-    // Ensure packetChannel is closed only when its key changes or the screen leaves composition.
-    DisposableEffect(packetChannel) {
-        onDispose {
-            packetChannel.trySend(TouchpadPacket.ButtonState(MouseButton.LEFT, pressed = false))
-            packetChannel.trySend(TouchpadPacket.ButtonState(MouseButton.RIGHT, pressed = false))
-            packetChannel.close()
         }
     }
 
@@ -218,23 +188,14 @@ fun TouchpadFullscreenScreen(
             when (event) {
                 Lifecycle.Event.ON_RESUME -> enterImmersive()
                 Lifecycle.Event.ON_PAUSE,
-                Lifecycle.Event.ON_STOP -> {
-                    heldMouseButton?.let { btn ->
-                        heldMouseButton = null
-                        packetChannel.trySend(
-                            TouchpadPacket.ButtonState(
-                                button = btn,
-                                pressed = false
-                            )
-                        )
-                    }
-                }
+                Lifecycle.Event.ON_STOP -> cancelInput()
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
 
         onDispose {
+            cancelInput()
             lifecycleOwner.lifecycle.removeObserver(observer)
             if (window != null && insetsController != null) {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -261,146 +222,99 @@ fun TouchpadFullscreenScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(packetChannel, tapSlopPx) {
+                .pointerInput(session.primaryComputerId, settings.holdDurationMs, tapSlopPx) {
                     awaitEachGesture {
                         val firstDown = awaitFirstDown(requireUnconsumed = false)
+                        if (!lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                            return@awaitEachGesture
+                        }
+                        val generation = inputGeneration
                         val downPos = firstDown.position
-                        val centerX = size.width / 2f
-                        val isDownOnRight = downPos.x >= centerX
-                        val targetButton = if (isDownOnRight) MouseButton.RIGHT else MouseButton.LEFT
+                        val onRight = downPos.x >= size.width / 2f
+                        val button = if (onRight) MouseButton.RIGHT else MouseButton.LEFT
+                        val holdDuration = settings.holdDurationMs.toLong()
+                        var pointerId = firstDown.id
+                        var lastPosition = downPos
+                        var moved = false
+                        var multitouch = false
+                        var holdTriggered = false
+                        var scrollIds: Pair<PointerId, PointerId>? = null
+                        var previousScrollY = 0f
 
-                        var activePointerId = firstDown.id
-                        var activeDownPos = downPos
-                        var hasMovedBeyondSlop = false
-                        var wasMultiTouch = false
-                        var isTwoFingerScrolling = false
-                        var twoFingerIds: Pair<PointerId, PointerId>? = null
-                        var isHoldTriggered = false
-                        var lastPrimaryPos = downPos
-                        var lastTwoFingerAvgY: Float? = null
-
-                        val holdTimerJob = gestureScope.launch {
-                            delay(260L)
-                            isHoldTriggered = true
-                            heldMouseButton = targetButton
-                            packetChannel.trySend(
-                                TouchpadPacket.ButtonState(
-                                    button = targetButton,
-                                    pressed = true
-                                )
-                            )
-                            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        fun pressAndHold() {
+                            holdTriggered = true
+                            heldMouseButton = button
+                            core.nativeSendButtonState(button.ordinal, true)
+                            if (latestHaptics) view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                         }
 
+                        val holdJob = gestureScope.launch {
+                            delay(holdDuration)
+                            if (generation == inputGeneration) pressAndHold()
+                        }
+                        pendingHold = holdJob
                         try {
                             while (true) {
                                 val event = awaitPointerEvent()
+                                if (generation != inputGeneration) break
+
                                 val pressed = event.changes.filter { it.pressed }
-                                if (pressed.isEmpty()) break
+                                if (pressed.isEmpty()) {
+                                    if (!multitouch && !moved && !holdTriggered) {
+                                        val up = event.changes.firstOrNull { it.id == pointerId }
+                                        if (up != null && (up.position - downPos).getDistance() <= tapSlopPx) {
+                                            if (up.uptimeMillis - firstDown.uptimeMillis < holdDuration) {
+                                                core.nativeSendClick(button.ordinal)
+                                                if (latestHaptics) {
+                                                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                                }
+                                                tapFlash = TapFlashEvent(up.uptimeMillis, downPos, onRight)
+                                            } else {
+                                                pressAndHold()
+                                            }
+                                        }
+                                    }
+                                    break
+                                }
 
                                 if (pressed.size >= 2) {
-                                    wasMultiTouch = true
-                                    holdTimerJob.cancel()
-                                    if (isHoldTriggered || heldMouseButton != null) {
-                                        val btn = heldMouseButton ?: targetButton
-                                        heldMouseButton = null
-                                        isHoldTriggered = false
-                                        packetChannel.trySend(
-                                            TouchpadPacket.ButtonState(
-                                                button = btn,
-                                                pressed = false
-                                            )
-                                        )
+                                    multitouch = true
+                                    holdJob.cancel()
+                                    releaseHeldButton()
+                                    val first = pressed.firstOrNull { it.id == scrollIds?.first } ?: pressed[0]
+                                    val second = pressed.firstOrNull { it.id == scrollIds?.second && it.id != first.id }
+                                        ?: pressed.first { it.id != first.id }
+                                    val pair = first.id to second.id
+                                    val y = (first.position.y + second.position.y) / 2f
+                                    if (pair == scrollIds && abs(y - previousScrollY) > 0.5f) {
+                                        core.nativeSendScroll(y - previousScrollY)
                                     }
-
-                                    val currentPair = pressed[0].id to pressed[1].id
-                                    val avgY = (pressed[0].position.y + pressed[1].position.y) / 2f
-
-                                    if (!isTwoFingerScrolling || twoFingerIds != currentPair) {
-                                        isTwoFingerScrolling = true
-                                        twoFingerIds = currentPair
-                                        lastTwoFingerAvgY = avgY
-                                    } else {
-                                        val prevY = lastTwoFingerAvgY ?: avgY
-                                        val deltaY = avgY - prevY
-                                        lastTwoFingerAvgY = avgY
-                                        if (abs(deltaY) > 0.5f) {
-                                            packetChannel.trySend(TouchpadPacket.Scroll(deltaY))
-                                        }
-                                    }
-                                    event.changes.forEach { it.consume() }
+                                    scrollIds = pair
+                                    previousScrollY = y
                                 } else {
-                                    val pointer = pressed[0]
-                                    if (isTwoFingerScrolling || pointer.id != activePointerId) {
-                                        holdTimerJob.cancel()
-                                        isTwoFingerScrolling = false
-                                        twoFingerIds = null
-                                        lastTwoFingerAvgY = null
-                                        activePointerId = pointer.id
-                                        lastPrimaryPos = pointer.position
-                                        activeDownPos = pointer.position
-                                        pointer.consume()
+                                    val pointer = pressed.single()
+                                    if (scrollIds != null || pointer.id != pointerId) {
+                                        holdJob.cancel()
+                                        multitouch = true
+                                        scrollIds = null
+                                        pointerId = pointer.id
+                                        lastPosition = pointer.position
                                     } else {
-                                        val distFromDown = (pointer.position - activeDownPos).getDistance()
-                                        if (!hasMovedBeyondSlop && distFromDown > tapSlopPx) {
-                                            hasMovedBeyondSlop = true
-                                            if (!isHoldTriggered) {
-                                                holdTimerJob.cancel()
-                                            }
-                                            val delta = pointer.position - lastPrimaryPos
-                                            if (delta.x != 0f || delta.y != 0f) {
-                                                packetChannel.trySend(
-                                                    TouchpadPacket.Move(delta.x, delta.y)
-                                                )
-                                            }
-                                            lastPrimaryPos = pointer.position
-                                        } else if (hasMovedBeyondSlop) {
-                                            val delta = pointer.position - lastPrimaryPos
-                                            if (abs(delta.x) > 0.01f || abs(delta.y) > 0.01f) {
-                                                packetChannel.trySend(
-                                                    TouchpadPacket.Move(delta.x, delta.y)
-                                                )
-                                            }
-                                            lastPrimaryPos = pointer.position
+                                        val delta = pointer.position - lastPosition
+                                        if (moved || multitouch || holdTriggered || delta.getDistance() > tapSlopPx) {
+                                            moved = true
+                                            holdJob.cancel()
+                                            if (delta != Offset.Zero) core.nativeSendMove(delta.x, delta.y)
+                                            lastPosition = pointer.position
                                         }
-                                        pointer.consume()
                                     }
                                 }
-                            }
-
-                            holdTimerJob.cancel()
-                            if (isHoldTriggered || heldMouseButton != null) {
-                                val btn = heldMouseButton ?: targetButton
-                                heldMouseButton = null
-                                isHoldTriggered = false
-                                packetChannel.trySend(
-                                    TouchpadPacket.ButtonState(
-                                        button = btn,
-                                        pressed = false
-                                    )
-                                )
-                            } else if (!wasMultiTouch && !hasMovedBeyondSlop) {
-                                packetChannel.trySend(TouchpadPacket.Click(targetButton))
-                                view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                                tapFlash = TapFlashEvent(
-                                    id = System.currentTimeMillis(),
-                                    position = downPos,
-                                    isRightSide = isDownOnRight
-                                )
+                                event.changes.forEach { it.consume() }
                             }
                         } finally {
-                            holdTimerJob.cancel()
-                            if (isHoldTriggered || heldMouseButton != null) {
-                                val btn = heldMouseButton ?: targetButton
-                                heldMouseButton = null
-                                isHoldTriggered = false
-                                packetChannel.trySend(
-                                    TouchpadPacket.ButtonState(
-                                        button = btn,
-                                        pressed = false
-                                    )
-                                )
-                            }
+                            holdJob.cancel()
+                            if (pendingHold === holdJob) pendingHold = null
+                            releaseHeldButton()
                         }
                     }
                 }
@@ -477,9 +391,9 @@ fun TouchpadFullscreenScreen(
             }
             Surface(
                 modifier = Modifier
-                    .align(Alignment.TopStart)
+                    .align(Alignment.BottomCenter)
                     .displayCutoutPadding()
-                    .padding(top = 12.dp, start = 12.dp),
+                    .padding(bottom = 28.dp),
                 color = Color(0xFF0C4A6E).copy(alpha = 0.85f),
                 shape = RoundedCornerShape(999.dp),
                 border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.65f))
@@ -505,87 +419,138 @@ fun TouchpadFullscreenScreen(
             }
         }
 
-        // Unobtrusive top-right floating status and exit pill kept as sibling above touchpad surface.
-        Surface(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .displayCutoutPadding()
-                .padding(top = 12.dp, end = 12.dp),
-            color = Color(0xFF0F172A).copy(alpha = 0.55f),
-            shape = RoundedCornerShape(999.dp),
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
+        Column(
+            modifier = Modifier.align(Alignment.TopEnd).displayCutoutPadding().padding(top = 12.dp, end = 12.dp),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Row(
-                modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            Surface(
+                color = Color(0xFF0F172A).copy(alpha = 0.55f),
+                shape = RoundedCornerShape(999.dp),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (isConnected) Color(0xFF22C55E) else Color(0xFF64748B)
-                        )
-                )
-                Spacer(modifier = Modifier.width(2.dp))
-                Text(
-                    text = computer.name,
-                    color = Color.White.copy(alpha = 0.78f),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.widthIn(max = 136.dp)
-                )
-
-                Box(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape)
-                        .clickable(
-                            role = Role.Button,
-                            onClick = { isLandscape = !isLandscape }
-                        )
-                        .semantics {
-                            contentDescription = "Alternar orientação da tela"
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ScreenRotation,
-                        contentDescription = null,
-                        tint = Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-
                 Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(999.dp))
-                        .clickable(
-                            role = Role.Button,
-                            onClick = releaseHoldAndExit
-                        )
-                        .padding(horizontal = 10.dp, vertical = 10.dp)
-                        .semantics {
-                            contentDescription = "Sair do modo touchpad"
-                        },
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = null,
-                        tint = Color.White.copy(alpha = 0.85f),
-                        modifier = Modifier.size(16.dp)
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (session.connected) Color(0xFF22C55E) else Color(0xFF64748B)
+                            )
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(2.dp))
                     Text(
-                        text = "Sair",
-                        color = Color.White.copy(alpha = 0.85f),
+                        text = session.activeComputerName,
+                        color = Color.White.copy(alpha = 0.78f),
                         fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = if (session.multiPcActive) 96.dp else 136.dp)
                     )
+
+                    if (session.multiPcActive) {
+                        Box(
+                            modifier = Modifier.size(48.dp).clip(CircleShape)
+                                .toggleable(
+                                    value = session.edgeLocked,
+                                    role = Role.Switch,
+                                    onValueChange = onSetEdgeLock
+                                )
+                                .semantics {
+                                    contentDescription = if (session.edgeLocked) "Destravar PC" else "Travar PC"
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                if (session.edgeLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                                contentDescription = null,
+                                tint = if (session.edgeLocked) Color(0xFF38BDF8) else Color.White.copy(alpha = 0.7f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .clickable(
+                                role = Role.Button,
+                                onClick = { isLandscape = !isLandscape }
+                            )
+                            .semantics {
+                                contentDescription = "Alternar orientação da tela"
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ScreenRotation,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.7f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .clickable(
+                                role = Role.Button,
+                                onClick = releaseHoldAndExit
+                            )
+                            .padding(horizontal = 10.dp, vertical = 10.dp)
+                            .semantics {
+                                contentDescription = "Sair do modo touchpad"
+                            },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.85f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Sair",
+                            color = Color.White.copy(alpha = 0.85f),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+            if (session.multiPcActive && neighbors.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.widthIn(max = 300.dp).horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    neighbors.forEach { neighbor ->
+                        val available = neighbor.online && neighbor.pairingStatus == "APPROVED"
+                        Surface(
+                            onClick = {
+                                cancelInput()
+                                onSwitchActiveComputer(neighbor.id)
+                            },
+                            enabled = available,
+                            shape = CircleShape,
+                            color = Color(0xFF0F172A),
+                            contentColor = Color.White.copy(alpha = if (available) 0.86f else 0.45f)
+                        ) {
+                            Text(
+                                text = neighbor.name,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp).widthIn(max = 112.dp),
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                 }
             }
         }

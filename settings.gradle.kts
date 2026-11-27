@@ -13,6 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "TouchPadRemote-Android"
-include(":shared-protocol")
+rootProject.name = "TouchPadRemote"
 include(":android-app")

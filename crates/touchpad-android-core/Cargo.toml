@@ -1,0 +1,22 @@
+[package]
+name = "touchpad-android-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "touchpad_android_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+touchpad-protocol = { path = "../touchpad-protocol" }
+touchpad-storage = { path = "../touchpad-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+if-addrs = { workspace = true }
+jni = { workspace = true }
+
+[dev-dependencies]
+touchpad-server-core = { path = "../touchpad-server-core" }
