@@ -30,11 +30,10 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
       - name: Ensure Android SDK packages and NDK
         run: |
           SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "Using Android SDK at: $SDK_DIR"
           SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | head -n 1)
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" "platforms;android-34" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
